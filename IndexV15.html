@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>4L Run — Vertical 4L Edition</title>
+<style>
+  :root{
+    --bg-day:#87ceeb;
+    --bg-night:#1c1b29;
+  }
+  html,body{
+    margin:0;height:100%;background:var(--bg-day);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    transition:background 1s ease;
+  }
+  .wrap{display:flex;align-items:center;justify-content:center;height:100%}
+  canvas{
+    background:transparent;
+    box-shadow:0 8px 30px rgba(0,0,0,.25);
+    border-radius:16px;
+    touch-action:manipulation
+  }
+  .hint{
+    position:fixed;bottom:16px;left:50%;
+    transform:translateX(-50%);opacity:.7;font-size:14px;color:#000;
+  }
+  #logo{
+    position:fixed;top:8px;left:50%;transform:translateX(-50%);
+    width:70px;height:auto;opacity:.7;pointer-events:none;
+  }
+  body.night .hint{color:#fff;}
+</style>
+</head>
+<body>
+<img id="logo" src="https://assets.zyrosite.com/cdn-cgi/image/format=auto,w=375,fit=crop,q=95/mjE7lBQwGxcl75Zy/logo_vertical4l_sable_cercle-fotor-20250520142415-removebg-preview-m5KMq9aw0whbbXrn.png" alt="Vertical 4L logo">
+<div class="wrap">
+  <canvas id="game" width="900" height="300" aria-label="4L Run"></canvas>
+</div>
+<div class="hint">Espace / ▲ ou toucher pour sauter</div>
+
+<script>
+(() => {
+  const W=900,H=300;
+  const GROUND_Y=255;    // sol
+  const GRAVITY=0.35;    // descente douce
+  const JUMP_V=-10.5;    // hauteur de saut (entre-deux)
+  const START_SPEED=4.2; // vitesse de départ
+  const PHASE_INTERVAL=520; // alternance jour/nuit (points)
+  const REWARD_STEP=250; // bling tous les 250 points
+
+  const cvs=document.getElementById('game');
+  const ctx=cvs.getContext('2d');
+  let isNight=false, phaseIndex=0, lastRewardPts=0;
+
+  // --- petit "bling" WebAudio (récompense) ---
+  function playBling(){
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC) return;
+    const a=new AC(); const o=a.createOscillator(); const g=a.createGain();
+    o.type="sine"; o.frequency.value=880;
+    g.gain.value=0.15; o.connect(g).connect(a.destination);
+    o.start(); o.stop(a.currentTime+0.15);
+  }
+
+  // --- Images ---
+  const carImg=new Image(); carImg.src="car_4l.png"; // ton fichier local
+  const cactusImgs=[], cactusImgsNight=[];
+
+  const CAC1=`<svg xmlns='http://www.w3.org/2000/svg' width='60' height='100'>
+    <rect x='26' y='22' width='8' height='58' rx='4' fill='#08a04b'/>
+    <rect x='12' y='40' width='8' height='26' rx='4' fill='#08a04b'/>
+    <rect x='40' y='36' width='8' height='24' rx='4' fill='#08a04b'/>
+    <rect x='12' y='40' width='18' height='8' rx='4' fill='#08a04b'/>
+  </svg>`;
+  const CAC2=`<svg xmlns='http://www.w3.org/2000/svg' width='70' height='110'>
+    <rect x='25' y='18' width='10' height='64' rx='4' fill='#06b05b'/>
+    <rect x='42' y='35' width='8' height='30' rx='4' fill='#06b05b'/>
+  </svg>`;
+  const CAC1N=CAC1.replace(/#08a04b/g,'#e6e6e6');
+  const CAC2N=CAC2.replace(/#06b05b/g,'#e6e6e6');
+
+  [CAC1,CAC2].forEach(s=>{const i=new Image(); i.src='data:image/svg+xml;utf8,'+encodeURIComponent(s); cactusImgs.push(i);});
+  [CAC1N,CAC2N].forEach(s=>{const i=new Image(); i.src='data:image/svg+xml;utf8,'+encodeURIComponent(s); cactusImgsNight.push(i);});
+
+  // Lune + étoiles
+  const moon=new Image();
+  moon.src='data:image/svg+xml;utf8,'+encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+    <circle cx="50" cy="50" r="18" fill="#fef4c1"/><circle cx="60" cy="48" r="10" fill="#1c1b29"/></svg>`);
+
+  const stars=Array.from({length:40},()=>({x:Math.random()*W,y:Math.random()*150,r:Math.random()*1.5}));
+
+  const cloudImg=new Image();
+  cloudImg.src='data:image/svg+xml;utf8,'+encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='120' height='60'>
+    <ellipse cx='30' cy='35' rx='28' ry='16' fill='rgba(255,255,255,.95)'/>
+    <ellipse cx='60' cy='30' rx='32' ry='18' fill='rgba(255,255,255,.95)'/></svg>`);
+
+  // --- État du jeu ---
+  let state='READY';
+  let speed=START_SPEED;
+  let score=0;
+  let best=+(localStorage.getItem('v4l_best')||0);
+  const car={x:70, y:GROUND_Y-60, w:120, h:60, vy:0};
+  const obstacles=[];
+  let nextSpawn=0; // ⚠️ manquait : causait des "cactus cassés"
+  const clouds=[];
+  for(let i=0;i<3;i++) clouds.push({x:W+i*300,y:40+Math.random()*70,s:0.4+Math.random()*0.4});
+
+  // --- Fonctions utilitaires ---
+  function padBox(b,p){return{x:b.x+p,y:b.y+p,w:b.w-p*2,h:b.h-p*2};}
+  function overlap(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;}
+
+  function reset(){
+    state='READY'; speed=START_SPEED; score=0;
+    car.y=GROUND_Y-car.h; car.vy=0;
+    obstacles.length=0; nextSpawn=0;
+    phaseIndex=0; isNight=false; document.body.classList.remove('night');
+    document.body.style.background="var(--bg-day)";
+    lastRewardPts=0;
+  }
+
+  function spawnObstacle(){
+    const set=isNight?cactusImgsNight:cactusImgs;
+    const img=Math.random()<0.5?set[0]:set[1];
+    // tailles cohérentes et posées au sol
+    const baseW=32, baseH=60;
+    const scale=0.9+Math.random()*0.5;
+    const w=Math.round(baseW*scale);
+    const h=Math.round(baseH*scale);
+    obstacles.push({x:W+60,y:GROUND_Y-h,w,h,img});
+    nextSpawn = 90 + Math.random()*90; // espacement plus large & stable
+  }
+
+  // --- Rendu ---
+  function drawSky(){
+    if(isNight){
+      ctx.fillStyle='#1c1b29'; ctx.fillRect(0,0,W,H);
+      // étoiles
+      ctx.fillStyle='#fff';
+      stars.forEach(s=>ctx.fillRect(s.x,s.y,s.r,s.r));
+      // lune
+      ctx.drawImage(moon, 760, 40, 60, 60);
+    }else{
+      ctx.fillStyle='#87ceeb'; ctx.fillRect(0,0,W,H);
+    }
+  }
+
+  function drawDesert(){
+    // dunes + opacité augmentée pour être bien visibles
+    ctx.fillStyle = isNight ? '#3b3225' : '#f0c97a';
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y-42);
+    ctx.bezierCurveTo(150,GROUND_Y-65,300,GROUND_Y-25,450,GROUND_Y-42);
+    ctx.bezierCurveTo(650,GROUND_Y-75,780,GROUND_Y-25,900,GROUND_Y-42);
+    ctx.lineTo(900,GROUND_Y);
+    ctx.lineTo(0,GROUND_Y);
+    ctx.closePath();
+    ctx.globalAlpha = isNight ? 0.55 : 0.5; // 🔼 plus visible
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawGround(){
+    // bande sable
+    ctx.fillStyle = isNight ? '#3a3325' : '#c2b280';
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    // traits (défilement)
+    ctx.strokeStyle = isNight ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)';
+    ctx.lineWidth = 2;
+    const off = (Date.now()/20 * speed) % 40;
+    for (let x=-off; x<W; x+=40) {
+      ctx.beginPath();
+      ctx.moveTo(x, GROUND_Y+18);
+      ctx.lineTo(x+20, GROUND_Y+18);
+      ctx.stroke();
+    }
+  }
+
+  function drawClouds(){
+    ctx.globalAlpha=isNight?0.3:1;
+    clouds.forEach(c=>{
+      ctx.drawImage(cloudImg,c.x,c.y,120,60);
+      c.x -= speed*0.3*c.s;
+      if(c.x<-140){c.x=W+Math.random()*300;c.y=30+Math.random()*80;}
+    });
+    ctx.globalAlpha=1;
+  }
+
+  function drawCar(){ ctx.drawImage(carImg, car.x, car.y, car.w, car.h); }
+
+  function drawUI(){
+    ctx.fillStyle=isNight?'rgba(255,255,255,.8)':'rgba(0,0,0,.7)';
+    ctx.font='bold 16px system-ui,Arial';
+    const s=Math.floor(score/10).toString().padStart(5,'0');
+    ctx.fillText(`SCORE ${s}`, W-180, 26);
+    ctx.fillText(`BEST  ${String(best).padStart(5,'0')}`, W-180, 46);
+    if(state==='READY'){
+      ctx.fillText('4L Run — Appuie pour démarrer', W/2-200, H/2);
+      ctx.fillText('Espace / ▲ ou toucher pour sauter', W/2-150, H/2+20);
+    }
+    if(state==='OVER'){
+      ctx.fillText('GAME OVER', W/2-70, H/2-10);
+      ctx.fillText('Appuie pour rejouer', W/2-70, H/2+15);
+    }
+  }
+
+  // --- Update ---
+  function update(){
+    if(state!=='PLAY') return;
+
+    // progression très douce
+    speed += 0.0004;
+
+    // physique voiture
+    car.vy += GRAVITY;
+    car.y  += car.vy;
+    if(car.y > GROUND_Y - car.h){
+      car.y = GROUND_Y - car.h;
+      car.vy = 0;
+    }
+
+    // obstacles
+    if(--nextSpawn <= 0) spawnObstacle();
+    for(let i=obstacles.length-1;i>=0;i--){
+      const o = obstacles[i];
+      o.x -= speed;
+      if(o.x + o.w < -10) obstacles.splice(i,1);
+    }
+
+    // score + récompenses
+    score++;
+    const pts = Math.floor(score/10);
+    if(pts >= lastRewardPts + REWARD_STEP){
+      lastRewardPts = pts;
+      playBling();
+    }
+
+    // alternance jour/nuit par paliers fixes
+    const phase = Math.floor(pts / PHASE_INTERVAL);
+    if(phase !== phaseIndex){
+      phaseIndex = phase;
+      isNight = !isNight;
+      document.body.classList.toggle('night', isNight);
+      document.body.style.background = isNight ? 'var(--bg-night)' : 'var(--bg-day)';
+    }
+
+    // collisions (hitbox resserrées)
+    const carBox = padBox({x:car.x,y:car.y,w:car.w,h:car.h}, 12);
+    for(const o of obstacles){
+      const obBox = padBox({x:o.x,y:o.y,w:o.w,h:o.h}, 8);
+      if(overlap(carBox, obBox)){
+        state='OVER';
+        const bestPts = Math.floor(score/10);
+        best = Math.max(best, bestPts);
+        localStorage.setItem('v4l_best', best);
+        break;
+      }
+    }
+  }
+
+  // --- Boucle ---
+  function render(){
+    ctx.clearRect(0,0,W,H);
+    drawSky();
+    drawDesert();
+    drawGround();
+    drawClouds();
+    obstacles.forEach(o=>ctx.drawImage(o.img,o.x,o.y,o.w,o.h));
+    drawCar();
+    drawUI();
+  }
+
+  function loop(){ update(); render(); requestAnimationFrame(loop); }
+
+  // --- Contrôles ---
+  function jump(){
+    if(state==='READY'){
+      state='PLAY'; score=0; obstacles.length=0; nextSpawn=40; speed=START_SPEED;
+      isNight=false; document.body.classList.remove('night'); document.body.style.background='var(--bg-day)';
+      lastRewardPts=0;
+      car.y=GROUND_Y-car.h; car.vy=JUMP_V;
+      return;
+    }
+    if(state==='OVER'){ reset(); return; }
+    if(state==='PLAY' && car.vy===0){ car.vy=JUMP_V; }
+  }
+
+  document.addEventListener('keydown',e=>{
+    if(e.code==='Space'||e.code==='ArrowUp'){ e.preventDefault(); jump(); }
+  },{passive:false});
+  document.addEventListener('touchstart',e=>{ e.preventDefault(); jump(); },{passive:false});
+
+  // go
+  reset(); loop();
+})();
+</script>
+</body>
+</html>
